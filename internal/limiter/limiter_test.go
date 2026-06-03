@@ -1,6 +1,7 @@
 package limiter
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -84,4 +85,41 @@ func TestRateLimiter_RaceCondition(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// Benchmark 1: The Localhost Trap (All traffic hits exactly ONE shard)
+func BenchmarkRateLimiter_SingleIP(b *testing.B) {
+	limiter := NewIPRateLimiter(1000.0, 10.0)
+	targetIP := "127.0.0.1"
+
+	b.ResetTimer() // Reset timer so setup doesn't count against our score
+
+	// RunParallel executes the loop concurrently across all your CPU cores
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			limiter.Allow(targetIP)
+		}
+	})
+}
+
+func BenchmarkRateLimiter_MultiIP(b *testing.B) {
+	limiter := NewIPRateLimiter(1000.0, 10.0)
+
+	// Pre-generate 10,000 distinct, fake IP addresses so string allocation
+	// doesn't slow down our benchmark math
+	ips := make([]string, 10000)
+	for i := 0; i < 10000; i++ {
+		ips[i] = fmt.Sprintf("10.0.%d.%d", i/256, i%256)
+	}
+
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			// Cycle through the 10,000 different IPs
+			limiter.Allow(ips[i%10000])
+			i++
+		}
+	})
 }
