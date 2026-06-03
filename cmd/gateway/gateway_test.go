@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"intermediate/internal/limiter"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -113,5 +116,72 @@ func TestGatewayMiddleware_ContextTimeout(test *testing.T) {
 	// If it takes 3 seconds, the context timeout failed to cancel the proxy!
 	if duration >= 3*time.Second {
 		test.Errorf("Test took %v. The context timeout failed to sever the connection early!", duration)
+	}
+}
+
+func TestGracefulShutdown_WaitsForActiveRequests(test *testing.T) {
+	slowHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(1 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := &http.Server{
+		Addr:    "127.0.0.1:0",
+		Handler: slowHandler,
+	}
+
+	listener, err := net.Listen("tcp", srv.Addr)
+
+	if err != nil {
+		test.Fatalf("Failed to create listener: %v", err)
+	}
+
+	serverURL := "http://" + listener.Addr().String()
+
+	go func() {
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			test.Errorf("Server crashed unexpectedly: %v", err)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	requestCompleted := make(chan bool)
+
+	go func() {
+		resp, err := http.Get(serverURL)
+		if err != nil {
+			test.Errorf("Request failed during shutdown: %v", err)
+			requestCompleted <- false
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			test.Errorf("Expected 200 OK, got %d", resp.StatusCode)
+		}
+		requestCompleted <- true
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	shutdownStart := time.Now()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		test.Fatalf("Graceful shutdown failed: %v", err)
+	}
+
+	shutdownDuration := time.Since(shutdownStart)
+
+	success := <-requestCompleted
+	if !success {
+		test.Fatal("The active request was abruptly killed instead of finishing!")
+	}
+
+	if shutdownDuration < 800*time.Millisecond {
+		test.Errorf("Shutdown completed too quickly (%v). It did not wait for the active request!", shutdownDuration)
 	}
 }
