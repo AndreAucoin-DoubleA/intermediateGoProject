@@ -11,6 +11,9 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -78,10 +81,40 @@ func main() {
 	}
 
 	protectedHandler := gatewayMiddleware(limiter, proxyHandler)
-	http.Handle("/", protectedHandler)
 
-	fmt.Printf("Gateway is running on port %s\n", proxyPort)
-	if err := http.ListenAndServe(":"+proxyPort, nil); err != nil {
-		log.Fatal(err)
+	srv := &http.Server{
+		Addr:    ":" + proxyPort,
+		Handler: protectedHandler,
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fmt.Printf("Gateway is running on port %s\n", proxyPort)
+
+		// ErrServerClosed is expected when we call srv.Shutdown(), so we don't log it as a crash
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("Gateway server crashed: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("\nShutdown signal received. Commencing graceful shutdown of Gateway...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Graceful shutdown failed: %v\n", err)
+	} else {
+		log.Println("Gateway stopped accepting new requests and finished active ones.")
+	}
+
+	wg.Wait()
+	log.Println("Gateway exited cleanly.")
 }
