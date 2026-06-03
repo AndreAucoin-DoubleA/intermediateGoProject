@@ -68,3 +68,20 @@ func TestRateLimiter_Concurrency(t *testing.T) {
 		t.Errorf("Expected exactly 100 allowed requests, got %d", allowedCount)
 	}
 }
+
+func TestRateLimiter_RaceCondition(t *testing.T) {
+	limiter := NewIPRateLimiter(2000.0, 10.0)
+	targetIP := "192.168.1.1"
+
+	var wg sync.WaitGroup
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			limiter.Allow(targetIP)
+		}()
+	}
+
+	wg.Wait()
+}
