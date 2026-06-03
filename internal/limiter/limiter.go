@@ -1,6 +1,7 @@
 package limiter
 
 import (
+	"hash/fnv"
 	"sync"
 	"time"
 )
@@ -16,29 +17,53 @@ type TokenBucket struct {
 	lastTick   time.Time
 }
 
+// Shard contains a subset of the map and its own dedicated lock
+type Shard struct {
+	mu      sync.Mutex
+	buckets map[string]*TokenBucket
+}
+
 type IPRateLimiter struct {
-	mu         sync.Mutex
-	buckets    map[string]*TokenBucket
+	shards     [32]*Shard // Array of 32 independent locks
 	capacity   float64
 	refillRate float64
 }
 
 func NewIPRateLimiter(capacity, refillRate float64) *IPRateLimiter {
-	return &IPRateLimiter{
-		buckets:    make(map[string]*TokenBucket),
+	limiter := &IPRateLimiter{
 		capacity:   capacity,
 		refillRate: refillRate,
 	}
+
+	// Initialize all 32 shards independently
+	for i := 0; i < 32; i++ {
+		limiter.shards[i] = &Shard{
+			buckets: make(map[string]*TokenBucket),
+		}
+	}
+	return limiter
+}
+
+// getShardIndex hashes the IP string into a number between 0 and 31
+func getShardIndex(ip string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(ip))
+	return h.Sum32() % 32
 }
 
 func (limiter *IPRateLimiter) Allow(ip string) bool {
-	limiter.mu.Lock()
-	defer limiter.mu.Unlock()
+	// Find the exact shard for this IP
+	shardIndex := getShardIndex(ip)
+	shard := limiter.shards[shardIndex]
+
+	// Lock ONLY this shard; the other 31 remain perfectly open
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
 	now := time.Now()
-	bucket, exists := limiter.buckets[ip]
+	bucket, exists := shard.buckets[ip]
 	if !exists {
-		limiter.buckets[ip] = &TokenBucket{
+		shard.buckets[ip] = &TokenBucket{
 			capacity:   limiter.capacity,
 			tokens:     limiter.capacity - 1.0,
 			refillRate: limiter.refillRate,
@@ -48,11 +73,10 @@ func (limiter *IPRateLimiter) Allow(ip string) bool {
 	}
 
 	elapsed := now.Sub(bucket.lastTick).Seconds()
+	bucket.tokens += elapsed * limiter.refillRate
 
-	bucket.tokens += elapsed * bucket.refillRate
-
-	if bucket.tokens > bucket.capacity {
-		bucket.tokens = bucket.capacity
+	if bucket.tokens > limiter.capacity {
+		bucket.tokens = limiter.capacity
 	}
 
 	bucket.lastTick = now
